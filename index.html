@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Świt — lot o świcie nad górami, liczony w całości shaderem WebGL.">
+<title>Świt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;1,300&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; background: #000; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body.idle { cursor: none; }
+  #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #frame { position: relative; }
+  canvas { display: block; width: 100%; height: 100%; }
+  .title {
+    position: absolute; left: 0; right: 0; text-align: center; pointer-events: none;
+    font-family: "Cormorant Garamond", Georgia, serif; font-weight: 300; color: #f3e6d8;
+    letter-spacing: 0.6em; text-indent: 0.6em; opacity: 0;
+    text-shadow: 0 0 24px rgba(255, 170, 120, 0.35);
+  }
+  #t1 { top: 40%; font-size: clamp(28px, 5vw, 72px); }
+  #t2 { top: calc(40% + clamp(40px, 6.5vw, 96px)); font-size: clamp(11px, 1.1vw, 16px); letter-spacing: 0.9em; font-style: italic; }
+  #hud {
+    position: fixed; right: 16px; bottom: 12px; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    color: rgba(255,255,255,0.35); pointer-events: none; transition: opacity 1s;
+  }
+</style>
+</head>
+<body>
+<div id="stage"><div id="frame">
+  <canvas id="c"></canvas>
+  <div class="title" id="t1">ŚWIT</div>
+  <div class="title" id="t2">część pierwsza</div>
+</div></div>
+<div id="hud">spacja lub dotyk — pauza · F lub dwuklik — pełny ekran · R — od nowa</div>
+
+<script id="fs" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+out vec4 outColor;
+
+#define DURATION 20.0
+#define WATER -38.0
+
+vec3 SUN;
+vec3 SUNCOL;
+float DAY;
+float T;
+
+// ---------- noise (value noise with analytic derivatives) ----------
+float hash(vec2 p) {
+  p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
+  return fract(p.x * p.y * (p.x + p.y));
+}
+
+vec3 noised(vec2 x) {
+  vec2 i = floor(x), f = fract(x);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+  float a = hash(i), b = hash(i + vec2(1, 0)), c = hash(i + vec2(0, 1)), d = hash(i + vec2(1, 1));
+  float k1 = b - a, k2 = c - a, k4 = a - b - c + d;
+  return vec3(-1.0 + 2.0 * (a + k1 * u.x + k2 * u.y + k4 * u.x * u.y),
+              2.0 * du * vec2(k1 + k4 * u.y, k2 + k4 * u.x));
+}
+
+const mat2 m2 = mat2(0.8, -0.6, 0.6, 0.8);
+
+// eroded fbm terrain: derivative damping makes ridges sharp and valleys smooth
+float terrain(vec2 x, int oct) {
+  vec2 p = x * 0.0021;
+  float a = 0.0, b = 1.0;
+  vec2 d = vec2(0.0);
+  for (int i = 0; i < 16; i++) {
+    if (i >= oct) break;
+    vec3 n = noised(p);
+    d += n.yz;
+    a += b * n.x / (1.0 + dot(d, d));
+    b *= 0.5;
+    p = m2 * p * 2.0;
+  }
+  return 190.0 * a;
+}
+
+float fbm(vec2 p) {
+  float f = 0.0, a = 0.5;
+  for (int i = 0; i < 6; i++) { f += a * noised(p).x; p = m2 * p * 2.03; a *= 0.5; }
+  return f;
+}
+
+// ---------- camera path ----------
+vec3 camPath(float t) {
+  return vec3(t * 34.0 + 400.0, 0.0, 170.0 * sin(t * 0.11) + 55.0 * sin(t * 0.37 + 1.0) - 120.0);
+}
+
+float camHeight(float t) {
+  float h = -1e9;
+  for (int i = 0; i < 6; i++) {
+    vec3 p = camPath(t + float(i) * 0.7 - 1.0);
+    h = max(h, terrain(p.xz, 5));
+  }
+  return max(h, WATER) + 55.0;
+}
+
+// ---------- sky ----------
+vec3 skyBase(vec3 rd) {
+  float sd = max(dot(rd, SUN), 0.0);
+  float y = max(rd.y, 0.0);
+  vec3 zen = mix(vec3(0.035, 0.06, 0.16), vec3(0.07, 0.17, 0.45), DAY);
+  vec3 hor = mix(vec3(0.42, 0.30, 0.44), vec3(1.15, 0.58, 0.30), pow(sd, 3.0));
+  hor = mix(hor * 0.55, hor, DAY);
+  vec3 col = mix(hor, zen, pow(y, 0.42));
+  col += SUNCOL * 0.20 * pow(sd, 6.0);
+  col += SUNCOL * 0.55 * pow(sd, 48.0);
+  return col;
+}
+
+vec3 sky(vec3 rd) {
+  vec3 col = skyBase(rd);
+  float sd = max(dot(rd, SUN), 0.0);
+  col += SUNCOL * 9.0 * smoothstep(0.99955, 0.99975, sd);
+
+  if (rd.y > 0.0) {
+    vec2 uv = rd.xz / (rd.y + 0.06) * 0.55 + vec2(T * 0.012, 0.0);
+    float n = fbm(uv * 1.3);
+    float c = smoothstep(-0.05, 0.55, n + 0.08);
+    float thick = smoothstep(0.1, 0.9, n + 0.08);
+    vec3 cc = mix(vec3(0.16, 0.13, 0.22), vec3(0.30, 0.27, 0.36), DAY);
+    cc += SUNCOL * (0.22 + 1.1 * pow(sd, 5.0)) * (1.0 - 0.65 * thick);
+    col = mix(col, cc, c * 0.85 * smoothstep(0.015, 0.22, rd.y));
+  }
+  return col;
+}
+
+// ---------- terrain tracing ----------
+float march(vec3 ro, vec3 rd, float tmin, float tmax, int oct, int steps) {
+  if (rd.y > 0.0) tmax = min(tmax, (240.0 - ro.y) / rd.y);
+  float t = tmin;
+  for (int i = 0; i < 400; i++) {
+    if (i >= steps) break;
+    vec3 p = ro + t * rd;
+    float h = p.y - terrain(p.xz, oct);
+    if (abs(h) < 0.0012 * t || t > tmax) break;
+    t += 0.45 * h;
+  }
+  return t > tmax ? 1e9 : t;
+}
+
+vec3 calcNormal(vec3 p, float t, int oct) {
+  vec2 e = vec2(max(0.0012 * t, 0.02), 0.0);
+  return normalize(vec3(terrain(p.xz - e.xy, oct) - terrain(p.xz + e.xy, oct),
+                        2.0 * e.x,
+                        terrain(p.xz - e.yx, oct) - terrain(p.xz + e.yx, oct)));
+}
+
+float softShadow(vec3 ro, vec3 rd) {
+  float res = 1.0, t = 1.0;
+  for (int i = 0; i < 72; i++) {
+    vec3 p = ro + t * rd;
+    float h = p.y - terrain(p.xz, 7);
+    res = min(res, 14.0 * h / t);
+    t += clamp(h, 1.5, 45.0);
+    if (res < 0.001 || p.y > 260.0) break;
+  }
+  return smoothstep(0.0, 1.0, clamp(res, 0.0, 1.0));
+}
+
+vec3 shade(vec3 p, vec3 n, vec3 rd, float t) {
+  float var = noised(p.xz * 0.05).x;
+  vec3 rock = mix(vec3(0.13, 0.10, 0.085), vec3(0.08, 0.065, 0.06), 0.5 + 0.5 * var);
+  vec3 grass = mix(vec3(0.045, 0.07, 0.03), vec3(0.07, 0.075, 0.035), 0.5 + 0.5 * var);
+  vec3 alb = mix(rock, grass, smoothstep(0.78, 0.92, n.y) * smoothstep(90.0, 20.0, p.y));
+
+  float snowLine = 70.0 + 28.0 * noised(p.xz * 0.013).x;
+  float snow = smoothstep(snowLine, snowLine + 25.0, p.y) * smoothstep(0.55, 0.78, n.y);
+  alb = mix(alb, vec3(0.62, 0.66, 0.75), snow);
+
+  // wet shore
+  alb *= mix(0.55, 1.0, smoothstep(WATER, WATER + 4.0, p.y));
+
+  float dif = clamp(dot(n, SUN), 0.0, 1.0);
+  float sh = dif > 0.001 ? softShadow(p + n * 0.8, SUN) : 0.0;
+  float amb = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+  vec3 back = normalize(vec3(-SUN.x, 0.0, -SUN.z));
+  float bac = clamp(dot(n, back) * 0.5 + 0.5, 0.0, 1.0);
+
+  vec3 skyAmb = mix(vec3(0.10, 0.10, 0.20), vec3(0.28, 0.34, 0.52), DAY);
+  vec3 lin = dif * sh * SUNCOL * 3.2
+           + amb * skyAmb * 0.9
+           + bac * SUNCOL * 0.06 * amb;
+
+  vec3 col = alb * lin;
+
+  // glint on snow facing the sun
+  vec3 h = normalize(SUN - rd);
+  col += snow * sh * dif * SUNCOL * 0.35 * pow(clamp(dot(n, h), 0.0, 1.0), 24.0);
+  return col;
+}
+
+vec3 applyFog(vec3 col, vec3 ro, vec3 rd, float t) {
+  vec3 fd = normalize(vec3(rd.x, 0.0, rd.z));
+  vec3 fogCol = skyBase(fd) * 0.95;
+  float sd = max(dot(rd, SUN), 0.0);
+  fogCol += SUNCOL * 0.25 * pow(sd, 8.0);
+
+  // distance haze + dense mist hugging the valleys
+  float b = 0.06;
+  float ry = abs(rd.y) < 1e-4 ? 1e-4 : rd.y;
+  float hf = 0.0025 * exp(-(ro.y - WATER) * b) * (1.0 - exp(-t * ry * b)) / (b * ry);
+  float f = 1.0 - exp(-(t * mix(0.00022, 0.00015, DAY) + hf));
+  vec3 mist = mix(vec3(0.30, 0.26, 0.36), fogCol, 0.6);
+  return mix(col, mix(fogCol, mist, clamp(hf * 0.5, 0.0, 0.6)), f);
+}
+
+vec3 render(vec3 ro, vec3 rd) {
+  float tmax = 4200.0;
+  float tw = rd.y < 0.0 ? (WATER - ro.y) / rd.y : 1e9;
+  float t = march(ro, rd, 1.0, min(tmax, tw), 9, 320);
+
+  if (t < 1e8) {
+    vec3 p = ro + t * rd;
+    vec3 n = calcNormal(p, t, 15);
+    return applyFog(shade(p, n, rd, t), ro, rd, t);
+  }
+
+  if (tw < tmax) {
+    vec3 p = ro + tw * rd;
+    vec2 q = p.xz * 0.06;
+    vec3 n1 = noised(q + vec2(T * 0.35, T * 0.2));
+    vec3 n2 = noised(q * 2.7 - vec2(T * 0.5, -T * 0.3));
+    float fall = exp(-tw * 0.0025);
+    vec3 n = normalize(vec3(-(n1.y + 0.5 * n2.y) * 0.018 * fall, 1.0, -(n1.z + 0.5 * n2.z) * 0.018 * fall));
+    vec3 rr = reflect(rd, n);
+    float fre = 0.02 + 0.98 * pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
+
+    vec3 refl;
+    float tr = march(p + vec3(0.0, 0.3, 0.0), rr, 1.0, 2500.0, 7, 160);
+    if (tr < 1e8) {
+      vec3 pr = p + rr * tr;
+      refl = applyFog(shade(pr, calcNormal(pr, tw + tr, 9), rr, tw + tr), p, rr, tr);
+    } else {
+      refl = sky(rr);
+    }
+    vec3 deep = vec3(0.008, 0.018, 0.025);
+    vec3 col = mix(deep, refl, fre);
+    return applyFog(col, ro, rd, tw);
+  }
+
+  return sky(rd);
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+  vec2 uv = (2.0 * frag - uRes) / uRes.y;
+  vec2 q = frag / uRes;
+  T = uTime;
+
+  float k = clamp(T / DURATION, 0.0, 1.0);
+  float elev = mix(-0.045, 0.10, k);
+  SUN = normalize(vec3(1.0, elev, 0.30));
+  DAY = smoothstep(-0.05, 0.10, elev);
+  SUNCOL = mix(vec3(1.0, 0.26, 0.08), vec3(1.0, 0.70, 0.45), smoothstep(-0.02, 0.10, elev))
+         * (0.35 + 1.5 * smoothstep(-0.06, 0.04, elev));
+
+  vec3 ro = camPath(T);
+  vec3 ta = camPath(T + 2.0);
+  ro.y = camHeight(T);
+  ta.y = camHeight(T + 2.0) - 9.0;
+  float roll = -0.10 * cos(T * 0.11 + 0.3);
+  vec3 ww = normalize(ta - ro);
+  vec3 uu = normalize(cross(ww, vec3(sin(roll), cos(roll), 0.0)));
+  vec3 vv = cross(uu, ww);
+  vec3 rd = normalize(uv.x * uu + uv.y * vv + 1.9 * ww);
+
+  vec3 col = render(ro, rd);
+
+  col = aces(col * (1.2 - 0.38 * DAY));
+  col = pow(col, vec3(1.0 / 2.2));
+  col = col * col * (3.0 - 2.0 * col) * 0.35 + col * 0.65;   // gentle S-curve
+  col *= 0.35 + 0.65 * pow(16.0 * q.x * q.y * (1.0 - q.x) * (1.0 - q.y), 0.18);
+  col += (hash(frag + fract(T * 7.13) * 91.7) - 0.5) * 0.028;
+  col *= smoothstep(0.0, 2.2, T) * smoothstep(DURATION, DURATION - 1.8, T);
+
+  outColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const DURATION = 20;
+  const ASPECT = 2.39;
+  const params = new URLSearchParams(location.search);
+  const frozen = params.has('t') ? parseFloat(params.get('t')) : null;
+  let scale = params.has('scale') ? parseFloat(params.get('scale')) : 0.55;
+  const adaptive = !params.has('scale');
+
+  const canvas = document.getElementById('c');
+  const frame = document.getElementById('frame');
+  const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
+  if (!gl) { document.body.innerHTML = '<p style="color:#fff;font:16px sans-serif;padding:2em">Ta przeglądarka nie obsługuje WebGL2.</p>'; return; }
+
+  const vs = `#version 300 es
+  void main(){ vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }`;
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, document.getElementById('fs').textContent));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  const uRes = gl.getUniformLocation(prog, 'uRes');
+  const uTime = gl.getUniformLocation(prog, 'uTime');
+  gl.bindVertexArray(gl.createVertexArray());
+
+  let cssW = 0, cssH = 0;
+  function layout() {
+    const w = innerWidth, h = innerHeight;
+    cssW = Math.min(w, h * ASPECT);
+    cssH = cssW / ASPECT;
+    frame.style.width = cssW + 'px';
+    frame.style.height = cssH + 'px';
+  }
+  function applyScale() {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    canvas.width = Math.max(64, Math.round(cssW * dpr * scale));
+    canvas.height = Math.max(27, Math.round(cssH * dpr * scale));
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  addEventListener('resize', () => { layout(); applyScale(); });
+  layout(); applyScale();
+
+  const t1 = document.getElementById('t1');
+  const t2 = document.getElementById('t2');
+  const hud = document.getElementById('hud');
+  const fade = (t, a, b, c, d) => Math.max(0, Math.min((t - a) / (b - a), 1, (d - t) / (d - c)));
+
+  let paused = false, clock = 0, last = performance.now();
+  let acc = 0, frames = 0;
+
+  addEventListener('keydown', e => {
+    if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+    if (e.code === 'KeyF') toggleFs();
+    if (e.code === 'KeyR') clock = 0;
+  });
+  const toggleFs = () => {
+    try { document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}); } catch (_) {}
+  };
+  let clickTimer = null;
+  addEventListener('click', () => {
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(() => { paused = !paused; }, 250);
+  });
+  addEventListener('dblclick', () => { clearTimeout(clickTimer); toggleFs(); });
+  let idleTimer = null;
+  addEventListener('mousemove', () => {
+    document.body.classList.remove('idle');
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => document.body.classList.add('idle'), 2000);
+  });
+  setTimeout(() => hud.style.opacity = 0, 5000);
+
+  function tick(now) {
+    const dt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    if (!paused) clock = (clock + dt) % DURATION;
+    const t = frozen ?? clock;
+
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.uniform1f(uTime, t);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    t1.style.opacity = fade(t, 3.0, 5.0, 8.5, 10.5);
+    t2.style.opacity = fade(t, 4.2, 6.0, 8.5, 10.5) * 0.8;
+
+    if (adaptive && !paused && frozen === null) {
+      acc += dt; frames++;
+      if (frames === 20) {
+        const ms = acc / frames * 1000;
+        if (ms > 24 && scale > 0.3) { scale *= 0.87; applyScale(); }
+        else if (ms < 15 && scale < 1.0) { scale = Math.min(1.0, scale * 1.08); applyScale(); }
+        acc = 0; frames = 0;
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
